@@ -5,6 +5,11 @@ from matplotlib.patches import Circle, Rectangle
 from enum import Enum
 from dataclasses import dataclass
 import streamlit as st
+from scipy.special import j1, airy
+
+def parse_formula(formula):
+    """Convert r^n to r**n for user formulas."""
+    return formula.replace('^', '**')
 
 # constants
 NM=1e-9
@@ -19,6 +24,7 @@ class ApertureType(Enum):
     SQUARE_OBSTACLE='Непрозрочный экран'
     TRIANGLE='Треугольное отверстие'
     DIFFRACTION_GRATING='Дифракционная решетка'
+    CUSTOM='Пользовательская'
 
 # STANDART EXAMPLES - PRESETS
 
@@ -32,6 +38,18 @@ class Preset:
     params: dict
     screen_size_mm: float
     grid_points: int
+
+CUSTOM_TEMPLATES = [
+    {'name': 'Квадратичная линза (φ=πr²/λf)', 
+     'amp': '1', 'phase': 'pi*r^2/(wavelength*f)', 
+     'params': {'lambda': 500e-9, 'f': 0.5}},
+    {'name': 'Зонная пластина Френеля', 
+     'amp': '1', 'phase': 'pi*r^2/(wavelength*f)*(1-2*floor(r/wavelength/f))', 
+     'params': {'lambda': 500e-9, 'f': 0.5}},
+    {'name': 'Спираль Френеля', 
+     'amp': '1', 'phase': 'atan2(y,x)', 
+     'params': {}},
+]
 
 PRESETS = [
     Preset(
@@ -95,6 +113,12 @@ PRESETS = [
         grid_points=512,
     ),
 ]
+
+# PARSING CUSTOM MASKS
+def parse_formula(formula):
+    '''convert r^2 to r**2 and basic math support (less human stress)'''
+    formula=formula.replace('^','**')
+    return formula
 
 # CREATING APERTURE MASKS
 def make_single_slit_mask(N,size,width):
@@ -166,6 +190,24 @@ def make_diffraction_grating_mask(N,size,period,duty_cycle):
     mask=(X%period)<=slit_width
     return mask
 
+def make_custom_mask(N,size,amp_formula,phase_formula,params):
+    '''custom aperture from user formulas A(r) and phi(r)'''
+    x=np.linspace(-size/2,size/2,N)
+    y=np.linspace(-size/2,size/2,N)
+    X,Y=np.meshgrid(x,y)
+    R=np.sqrt(X**2+Y**2)
+
+    from numpy import sin,cos,exp,log,sqrt,pi,zeros,ones,ones_like,floor,arctan2
+    env={'sin':sin,'cos':cos,'exp':exp,'log':log,'sqrt':sqrt,'pi':pi,'floor':floor,'atan2':arctan2,'r':R,'R':R,'x':X,'X':X,'y':Y,'Y':Y}
+    env.update(params)
+    if 'lambda' in env:
+        env['wavelength'] = env.pop('lambda')
+    
+    amp=eval(parse_formula(amp_formula),env) if amp_formula else ones_like(R)
+    phi=eval(parse_formula(phase_formula),env) if phase_formula else zeros_like(R)
+    return amp*np.exp(1j*phi)
+
+
 def make_aperture(aperture_type,N,aperture_size,params):
     '''Creating aperture mask of a given type'''
     if aperture_type == ApertureType.SINGLE_SLIT:
@@ -191,8 +233,35 @@ def make_aperture(aperture_type,N,aperture_size,params):
         period = params.get("period", aperture_size / 20)
         duty = params.get("duty_cycle", 0.5)
         return make_diffraction_grating_mask(N, aperture_size, period, duty)
+    elif aperture_type==ApertureType.CUSTOM:
+        extra_params = {k: v for k, v in params.items() if k not in ('amp', 'phase')}
+        return make_custom_mask(N,aperture_size,params.get('amp','1'),
+                                                params.get('phase','0'),
+                                                extra_params)
     else:
         return np.ones((N, N))
+
+def theoretical_slit_profile(x, slit_width, wavelength, b):
+    alpha = np.pi * slit_width * x / (wavelength * b)
+    return (np.sin(alpha + 1e-10) / (alpha + 1e-10))**2
+
+def theoretical_circular_profile(r, radius, wavelength, b):
+    k = 2 * np.pi / wavelength
+    rho = k * radius * r / b
+    j = j1(rho + 1e-10)
+    return (2 * j / (rho + 1e-10))**2
+
+def find_minima_positions(slit_width, wavelength, b, screen_size, n_points=5):
+    x = np.linspace(0, screen_size/2, 1000)
+    alpha = np.pi * slit_width * x / (wavelength * b)
+    vals = (np.sin(alpha + 1e-10) / (alpha + 1e-10))**2
+    minima_pos = []
+    for i in range(1, len(vals)-1):
+        if vals[i] < vals[i-1] and vals[i] < vals[i+1] and vals[i] < 0.1:
+            minima_pos.append(x[i])
+            if len(minima_pos) >= n_points:
+                break
+    return np.array(minima_pos) * 1000
     
 # CALCULATING FRENsEL DIFFRACTION
 def frensel_diffraction(aperture,wavelength,a,b,aperture_size,screen_size,N):
@@ -228,6 +297,7 @@ def frensel_diffraction(aperture,wavelength,a,b,aperture_size,screen_size,N):
     U_eff=aperture_resampled*phase_b*phase_a
 
     prefactor=np.exp(1j*k*b)/(1j*wavelength*b)
+
     U_fft=np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(U_eff)))
     U_fft*=dx*dy
     
@@ -284,6 +354,19 @@ def compute_diffraction(aperture,wavelength,a,b,aperture_size,screen_size,N,mode
 def main():
     st.set_page_config(page_title='Дифракция Френеля и Фраунгофера',layout='wide')
     st.title('Дифракция Френеля и Фраунгофера')
+    
+    with st.expander("Что делает FFT в этой программе?", expanded=False):
+        st.markdown("""
+        **Быстрое преобразование Фурье (FFT)** используется для численного расчёта дифракции:
+        
+        - **Дифракция Фраунгофера** (в дальней зоне): поле на экране = Фурье-образ апертуры
+          $$U(\\xi,\\eta) \\propto \\iint A(x,y) e^{-i\\frac{2\\pi}{\\lambda b}(x\\xi + y\\eta)} dx\\,dy$$
+          Это просто `fft2(aperture)` — FFT напрямую даёт угловой спектр.
+        
+        - **Дифракция Френеля** (ближняя зона): к результату FFT добавляются квадратичные фазовые множители (чирпы), учитывающие кривизну волнового фронта на расстоянии `b`.
+        
+        FFT позволяет вычислить эти интегралы за $O(N^2 \\log N)$ операций вместо $O(N^4)$ при прямом интегрировании.
+        """)
 
     col1,col2=st.columns([1,2])
     
@@ -345,9 +428,23 @@ def main():
         elif ap_type == ApertureType.DIFFRACTION_GRATING:
             params["period"] = st.number_input("Период решётки (мм)", value=default_params.get("period", 0.05), min_value=0.001)
             params["duty_cycle"] = st.slider("Заполнение (0-1)", 0.1, 0.9, default_params.get("duty_cycle", 0.5))
-        
+        elif ap_type == ApertureType.CUSTOM:
+            template = st.selectbox('Шаблон', [t['name'] for t in CUSTOM_TEMPLATES] + ['Своя формула'])
+            if template == 'Своя формула':
+                amp_formula = st.text_input('A(r) =', value='1')
+                phase_formula = st.text_input('φ(r) =', value='pi*r^2/(wavelength*f)')
+            else:
+                t = next(x for x in CUSTOM_TEMPLATES if x['name'] == template)
+                amp_formula = t['amp']
+                phase_formula = t['phase']
+            params['amp'] = amp_formula
+            params['phase'] = phase_formula
+            params['lambda'] = st.number_input('λ (нм)', value=500)
+            params['f'] = st.number_input('f (мм)', value=500)
         st.subheader('Режим Рассчета')
         mode=st.radio('Режим',['auto','frensel','fraunhofer'],horizontal=True)
+        show_theory = st.checkbox('Показать теорию', value=True)
+        show_minima = st.checkbox('Показать минимумы', value=True)
 
         params_key=(
             wavelength_nm,a,b,aperture_size_mm,screen_size_mm,grid_points,ap_type,tuple(sorted(params.items())))
@@ -361,42 +458,79 @@ def main():
                 screen_size=screen_size_mm*MM
                 N=int(grid_points)
 
-                params_m={k: v*MM for k,v in params.items()}
+                params_m={k: (v*MM if isinstance(v, (int, float)) else v) for k,v in params.items()}
                 aperture=make_aperture(ap_type,N,aperture_size,params_m)
 
                 intensity,x,y,mode_used,N_F=compute_diffraction(aperture,wavelength,a,b,aperture_size,screen_size,N,mode=mode)
 
                 fig=plt.figure(figsize=(12.8, 8.0))
-                gs=GridSpec(2,2,fig,hspace=0.3,wspace=0.3)
+                
+                if np.iscomplexobj(aperture):
+                    gs=GridSpec(2,3,fig,hspace=0.3,wspace=0.3)
+                    ax1 = fig.add_subplot(gs[0, 0])
+                    ax1a = fig.add_subplot(gs[0, 1])
+                    ax2 = fig.add_subplot(gs[0, 2])
+                else:
+                    gs=GridSpec(2,2,fig,hspace=0.3,wspace=0.3)
+                    ax1 = fig.add_subplot(gs[0, 0])
+                    ax2 = fig.add_subplot(gs[0, 1])
 
-                ax1 = fig.add_subplot(gs[0, 0])
                 extent = [-aperture_size_mm / 2, aperture_size_mm / 2,
                           -aperture_size_mm / 2, aperture_size_mm / 2]
-                ax1.imshow(aperture, cmap="gray", extent=extent, origin="lower")
+                if np.iscomplexobj(aperture):
+                    ax1.imshow(np.abs(aperture), cmap="gray", extent=extent, origin="lower")
+                    ax1.set_title("Апертура (амплитуда)")
+                    
+                    im_a = ax1a.imshow(np.angle(aperture), cmap="hsv", extent=extent, origin="lower")
+                    ax1a.set_title("Апертура (фаза)")
+                    fig.colorbar(im_a, ax=ax1a, label="фаза (рад)")
+                else:
+                    ax1.imshow(aperture, cmap="gray", extent=extent, origin="lower")
+                    ax1.set_title("Апертура")
+                
                 ax1.set_xlabel("мм")
                 ax1.set_ylabel("мм")
-                ax1.set_title("Апертура")
                 ax1.set_aspect("equal")
-
-                ax2 = fig.add_subplot(gs[0, 1])
                 extent = [-screen_size_mm / 2, screen_size_mm / 2,
                           -screen_size_mm / 2, screen_size_mm / 2]
                 im = ax2.imshow(intensity, cmap="hot", extent=extent, origin="lower", vmin=0, vmax=1)
                 ax2.set_xlabel("мм")
                 ax2.set_ylabel("мм")
                 mode_label = "Френель" if mode_used == "frensel" else "Фраунгофер"
-                ax2.set_title(f"Интенсивность ({mode_label}, N_F={N_F:.2f})")
+                ax2.set_title(f"Интенсивность ({mode_label}, λ={wavelength_nm}нм, b={b}м, N_F={N_F:.2f})",y=-0.3)
                 fig.colorbar(im, ax=ax2, label="I / I_max")
 
                 ax3 = fig.add_subplot(gs[1, :])
                 mid = len(y) // 2
                 x_mm = np.linspace(-screen_size_mm / 2, screen_size_mm / 2, len(x))
-                ax3.plot(x_mm, intensity[mid, :], "b-", linewidth=1)
+                ax3.plot(x_mm, intensity[mid, :], "b-", linewidth=1, label='Численно (FFT)')
                 ax3.set_xlabel("Положение на экране (мм)")
                 ax3.set_ylabel("I / I_max")
                 ax3.set_title("Профиль интенсивности (центральное сечение)")
                 ax3.grid(True, alpha=0.3)
                 ax3.set_xlim(-screen_size_mm / 2, screen_size_mm / 2)
+
+                if show_theory and mode_used == 'fraunhofer':
+                    if ap_type == ApertureType.SINGLE_SLIT:
+                        slit_width = params_m.get("width", 0.1e-3)
+                        x_theory = x_mm * 1e-3
+                        I_theory = theoretical_slit_profile(x_theory, slit_width, wavelength, b)
+                        ax3.plot(x_mm, I_theory, "r--", linewidth=1.5, alpha=0.7, label='Теория (sinc²)')
+                    elif ap_type == ApertureType.CIRCULAR:
+                        radius = params_m.get("radius", 0.5e-3)
+                        r_theory = np.abs(x_mm * 1e-3)
+                        I_theory = theoretical_circular_profile(r_theory, radius, wavelength, b)
+                        ax3.plot(x_mm, I_theory, "r--", linewidth=1.5, alpha=0.7, label='Теория (Эйри)')
+                
+                if show_minima and (ap_type == ApertureType.SINGLE_SLIT or ap_type == ApertureType.CIRCULAR):
+                    slit_width = params_m.get("width", params_m.get("radius", 0.1e-3)) * 2
+                    minima_pos = find_minima_positions(slit_width, wavelength, b, screen_size)
+                    for pos in minima_pos:
+                        if pos < screen_size_mm / 2:
+                            ax3.axvline(x=pos, color='green', linestyle=':', alpha=0.5, linewidth=0.8)
+                            ax3.axvline(x=-pos, color='green', linestyle=':', alpha=0.5, linewidth=0.8)
+
+                ax3.legend(loc='upper right', fontsize=9)
 
                 st.pyplot(fig)
             except Exception as e:
